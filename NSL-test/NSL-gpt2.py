@@ -5,6 +5,12 @@ import math
 import torch.nn.functional as F
 torch.set_printoptions(8)
 
+
+# 用于在生成步骤之间传递 K,V 状态
+KV_CACHE = None
+# 用于在单次 gpt2 调用中构建新缓存的临时变量
+NEW_KV_CACHE = None
+
 def gelu(x):
     """
         Task: Use the torch API to implement the approximate calculation formula of the `GELU`
@@ -112,7 +118,7 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
     
     return output
 
-def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
+def mha(x, attn, n_head,layer_idx):  # [n_seq, n_embd] -> [n_seq, n_embd]
     """
         Task: Complete the code of the multi-head attention
         
@@ -122,12 +128,13 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
             n_head: number of head
         Output: Tensorying multi-head attention and linear transformation, shape [n_seq, n_embd].
     """
+
+    global KV_CACHE, NEW_KV_CACHE
+
     c_attn, c_proj = attn['c_attn'], attn['c_proj']
 
     # qkv projection
-    x = linear(x, c_attn)  # [n_seq, n_embd] -> [n_seq, 3*n_embd]
-    
-    
+    x = linear(x, c_attn)  # [n_seq, n_embd] -> [n_seq, 3*n_embd]  
 
     # Split into qkv
     """
@@ -136,7 +143,17 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     """
 
     q, k, v = x.chunk(3, dim=-1)
-    
+
+    # 如果全局缓存存在，说明是生成阶段
+    if KV_CACHE is not None:
+        # 1. 从全局缓存中读取对应层的 past_k 和 past_v
+        past_k, past_v = KV_CACHE[layer_idx]['k'], KV_CACHE[layer_idx]['v']
+        # 2. 拼接
+        k = torch.cat((past_k, k), dim=0)
+        v = torch.cat((past_v, v), dim=0)
+
+    NEW_KV_CACHE.append({'k': k, 'v': v})
+
     qkv = [q, k, v]
 
     # Split into heads
@@ -154,8 +171,8 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
             | 0    0    0  ...   0  |
         Mask is a tensor whose dimension is [n_seq, n_seq]
     """
-    n_seq = qkv_heads[0][0].shape[0]
-    mask = torch.triu(torch.ones(n_seq, n_seq), diagonal=1)
+    n_seq_q, n_seq_k = q.shape[0], k.shape[0]
+    mask = torch.triu(torch.ones(n_seq_q, n_seq_k), diagonal=1 + n_seq_k - n_seq_q)
     causal_mask = mask.masked_fill(mask==1, float('-inf'))
 
     # Perform attention over each head
@@ -175,11 +192,11 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     return x
 
 
-def transformer_block(x, block, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
+def transformer_block(x, block, n_head, layer_idx):  # [n_seq, n_embd] -> [n_seq, n_embd]
     mlp, attn, ln_1, ln_2 = block['mlp'], block['attn'], block['ln_1'], block['ln_2']
     
     # multi-head causal self attention
-    x = x + mha(layer_norm(x, ln_1), attn, n_head=n_head)  # [n_seq, n_embd] -> [n_seq, n_embd]
+    x = x + mha(layer_norm(x, ln_1), attn, n_head=n_head, layer_idx=layer_idx)  # [n_seq, n_embd] -> [n_seq, n_embd]
 
     # position-wise feed forward network
     x = x + ffn(layer_norm(x, ln_2), mlp)  # [n_seq, n_embd] -> [n_seq, n_embd]
@@ -188,21 +205,43 @@ def transformer_block(x, block, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
 
 
 def gpt2(inputs, params, n_head):  # [n_seq] -> [n_seq, n_vocab]
+
+    global KV_CACHE, NEW_KV_CACHE
+
+    # 为本次前向传播初始化临时的 NEW_KV_CACHE
+    NEW_KV_CACHE = []
+
     wte, wpe, blocks, ln_f = params['wte'], params['wpe'], params['blocks'], params['ln_f']
     # token + positional embeddings
-    x = wte[inputs] + wpe[range(len(inputs))]  # [n_seq] -> [n_seq, n_embd]
+
+    if KV_CACHE is not None: # 选择输入的范围
+        past_length = KV_CACHE[0]['k'].shape[0]
+        x = wte[inputs[-1:]] + wpe[past_length : past_length + 1]
+    else:
+        x = wte[inputs] + wpe[range(len(inputs))]
+    # x = wte[inputs] + wpe[range(len(inputs))]  # [n_seq] -> [n_seq, n_embd]
+
     x = torch.Tensor(x)
   
-    # forward pass through n_layer transformer blocks
-    for block in blocks:
-        x = transformer_block(x, block, n_head=n_head)  # [n_seq, n_embd] -> [n_seq, n_embd]
+    for i, block in enumerate(blocks):
+        # 传递 layer_idx，以便 transformer_block 和 mha 能访问正确的缓存
+        x = transformer_block(x, block, n_head=n_head, layer_idx=i)
+
+     # 更新cache
+    KV_CACHE = NEW_KV_CACHE
 
     # projection to vocab
     x = layer_norm(x, ln_f)  # [n_seq, n_embd] -> [n_seq, n_embd]
+
     return x @ wte.T  # [n_seq, n_embd] -> [n_seq, n_vocab]
 
 
 def generate(inputs, params, n_head, n_tokens_to_generate):
+
+    global KV_CACHE
+    # 在每次调用 generate 时，必须重置全局缓存，以防上一次运行的干扰
+    KV_CACHE = None
+    
     from tqdm import tqdm
 
     for _ in tqdm(range(n_tokens_to_generate), "generating"):  # auto-regressive decode loop
