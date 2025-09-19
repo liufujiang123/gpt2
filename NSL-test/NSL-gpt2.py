@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import time
 import math
+import torch.nn.functional as F
 torch.set_printoptions(8)
 
 def gelu(x):
@@ -15,7 +16,9 @@ def gelu(x):
         Input: Tensor
         Output: Tensor
     """
-    pass
+
+    return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x ** 3)))
+
 
 
 def softmax(x):
@@ -24,7 +27,8 @@ def softmax(x):
         Input: Tensor
         Output: Tensor
     """
-    pass
+    exp_x = torch.exp(x - torch.max(x, dim=-1, keepdim=True).values)
+    return exp_x / torch.sum(exp_x, dim=-1, keepdim=True)
 
 
 def layer_norm(x, g_b, eps:float = 1e-5):
@@ -35,9 +39,17 @@ def layer_norm(x, g_b, eps:float = 1e-5):
             g_b: dictionary that load from gpt2 weight. g-gamma and b-bias are the keys
         Output: Tensor
     """
+
     g, b = torch.Tensor(g_b['g']), torch.Tensor(g_b['b'])
-    
-    pass
+
+
+    mean = x.mean(dim=-1, keepdim=True)
+    var = x.var(dim=-1, keepdim=True, unbiased=False)
+
+
+    x_norm = (x - mean) / torch.sqrt(var + eps)
+
+    return g * x_norm + b # 缩放和平移
 
 def linear(x, w_b):  # [m, in], [in, out], [out] -> [m, out]
     """
@@ -47,8 +59,9 @@ def linear(x, w_b):  # [m, in], [in, out], [out] -> [m, out]
             w_b: dictionary that load from gpt2 weight. w-weight and b-bias are the keys
         Output: Tensor
     """
-    w, b = w_b['w'], w_b['b']
-    pass
+    w, b = torch.Tensor(w_b['w']), torch.Tensor(w_b['b'])
+
+    return x @ w + b
     
 
 def ffn(x, mlp):  # [n_seq, n_embd] -> [n_seq, n_embd]
@@ -61,7 +74,12 @@ def ffn(x, mlp):  # [n_seq, n_embd] -> [n_seq, n_embd]
         Output: Tensor
     """
     w_b1, w_b2 = mlp['c_fc'], mlp['c_proj']
-    pass
+
+    x = linear(x, w_b1)
+    x = gelu(x)
+    x = linear(x, w_b2)
+
+    return x
 
 
 def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] -> [n_q, d_v]
@@ -77,7 +95,22 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
             mlp: dictionary that load from gpt2 weight. w_b1 and w_b2 are the params of two linear layer
         Output: Tensor
     """
-    pass
+    scores = q @ k.transpose(-2, -1)
+
+    d_k = q.size(-1)
+    scaled_scores = scores / math.sqrt(d_k)
+
+   
+
+    if mask is not None:
+        scaled_scores = scaled_scores + mask
+
+  
+    weights = softmax(scaled_scores)
+
+    output = weights @ v
+    
+    return output
 
 def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     """
@@ -90,19 +123,25 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
         Output: Tensorying multi-head attention and linear transformation, shape [n_seq, n_embd].
     """
     c_attn, c_proj = attn['c_attn'], attn['c_proj']
+
     # qkv projection
     x = linear(x, c_attn)  # [n_seq, n_embd] -> [n_seq, 3*n_embd]
     
+    
+
     # Split into qkv
     """
         Task: Split the q,k,v matrix from the tensor x
         Notes: [n_seq, 3*n_embd] -> 3 * [n_seq, n_embd]
     """
-    qkv = None # need to modify
+
+    q, k, v = x.chunk(3, dim=-1)
+    
+    qkv = [q, k, v]
 
     # Split into heads
     qkv_heads = [qkv_part.chunk(n_head, dim=-1) for qkv_part in qkv]  # 3 * [n_seq, n_embd] -> 3 * n_head * [n_seq, n_embd/n_head]
-    qkv_heads = list(zip(*qkv_heads))  # [3, n_head, n_seq, n_embd/n_head]
+    qkv_heads = list(zip(*qkv_heads))  #  [3, n_head, n_seq, n_embd/n_head]?  [n_head, 3, n_seq, n_embd/n_head]
 
     # Causal mask to hide future inputs from being attended to
     """
@@ -115,17 +154,20 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
             | 0    0    0  ...   0  |
         Mask is a tensor whose dimension is [n_seq, n_seq]
     """
-    causal_mask = None # need to modify
+    n_seq = qkv_heads[0][0].shape[0]
+    mask = torch.triu(torch.ones(n_seq, n_seq), diagonal=1)
+    causal_mask = mask.masked_fill(mask==1, float('-inf'))
 
     # Perform attention over each head
     out_heads = [attention(q, k, v, causal_mask) for q, k, v in qkv_heads]  # n_head * [n_seq, n_embd/n_head]
     
+
     # Merge heads
     """
         Task: merge multi-heads results
         Notes: n_head * [n_seq, n_embd/n_head] --> [n_seq, n_embd]
     """
-    x = None # need to modify
+    x = torch.cat(out_heads, dim=-1)
     
     # Out projection
     x = linear(x, c_proj)  # [n_seq, n_embd] -> [n_seq, n_embd]
@@ -149,8 +191,8 @@ def gpt2(inputs, params, n_head):  # [n_seq] -> [n_seq, n_vocab]
     wte, wpe, blocks, ln_f = params['wte'], params['wpe'], params['blocks'], params['ln_f']
     # token + positional embeddings
     x = wte[inputs] + wpe[range(len(inputs))]  # [n_seq] -> [n_seq, n_embd]
-    
     x = torch.Tensor(x)
+  
     # forward pass through n_layer transformer blocks
     for block in blocks:
         x = transformer_block(x, block, n_head=n_head)  # [n_seq, n_embd] -> [n_seq, n_embd]
@@ -166,6 +208,7 @@ def generate(inputs, params, n_head, n_tokens_to_generate):
     for _ in tqdm(range(n_tokens_to_generate), "generating"):  # auto-regressive decode loop
         logits = gpt2(inputs, params, n_head=n_head)  # model forward pass
         next_id = np.argmax(logits[-1])  # greedy sampling
+
         inputs.append(int(next_id))  # append prediction to input
 
     return inputs[len(inputs) - n_tokens_to_generate :]  # only return generated ids
@@ -195,6 +238,8 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
     return generated_ids
 
 
+    
+
 def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", models_dir: str = "models"):
     from utils import load_encoder_hparams_and_params
 
@@ -209,6 +254,7 @@ def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", m
 
     # generate output ids
     start = time.time()
+    
     output_ids = generate(input_ids, params, hparams["n_head"], n_tokens_to_generate)
     end = time.time()
     print(f"Time taken to generate {n_tokens_to_generate} tokens: {end - start:.2f}s")
