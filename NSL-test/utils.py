@@ -11,8 +11,14 @@ from encoder import get_encoder
 
 
 def download_gpt2_files(model_size, model_dir):
+    """下载GPT-2模型文件，如果本地已存在则跳过"""
     assert model_size in ["124M", "355M", "774M", "1558M"]
-    for filename in [
+    
+    # 确保模型目录存在
+    os.makedirs(model_dir, exist_ok=True)
+    
+    # 需要下载的文件列表
+    required_files = [
         "checkpoint",
         "encoder.json",
         "hparams.json",
@@ -20,26 +26,48 @@ def download_gpt2_files(model_size, model_dir):
         "model.ckpt.index",
         "model.ckpt.meta",
         "vocab.bpe",
-    ]:
-        url = "https://openaipublic.blob.core.windows.net/gpt-2/models"
-        r = requests.get(f"{url}/{model_size}/{filename}", stream=True)
-        r.raise_for_status()
-
-        with open(os.path.join(model_dir, filename), "wb") as f:
-            file_size = int(r.headers["content-length"])
-            chunk_size = 1000
-            with tqdm(
-                ncols=100,
-                desc="Fetching " + filename,
-                total=file_size,
-                unit_scale=True,
-                unit="b",
-            ) as pbar:
-                # 1k for chunk_size, since Ethernet packet size is around 1500 bytes
-                for chunk in r.iter_content(chunk_size=chunk_size):
-                    f.write(chunk)
-                    pbar.update(chunk_size)
-
+    ]
+    
+    base_url = f"https://openaipublic.blob.core.windows.net/gpt-2/models/{model_size}/"
+    
+    for filename in required_files:
+        local_path = os.path.join(model_dir, filename)
+        
+        # 检查文件是否已存在
+        if os.path.exists(local_path):
+            file_size = os.path.getsize(local_path)
+            print(f"文件已存在，跳过下载: {filename} ({file_size/1024/1024:.2f}MB)")
+            continue
+            
+        # 文件不存在，开始下载
+        url = base_url + filename
+        print(f"开始下载: {filename}")
+        
+        try:
+            with requests.get(url, stream=True) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get('content-length', 0))
+                
+                with open(local_path, 'wb') as f:
+                    with tqdm(
+                        desc=f"下载 {filename}",
+                        total=total_size,
+                        unit='B',
+                        unit_scale=True,
+                        ncols=100
+                    ) as pbar:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:  # 过滤保持活动的数据包
+                                f.write(chunk)
+                                pbar.update(len(chunk))
+            
+            print(f"下载完成: {filename}")
+            
+        except Exception as e:
+            print(f"下载失败: {filename} - {str(e)}")
+            if os.path.exists(local_path):
+                os.remove(local_path)  # 删除可能不完整的文件
+            raise
 
 def load_gpt2_params_from_tf_ckpt(tf_ckpt_path, hparams):
     def set_in_nested_dict(d, keys, val):
